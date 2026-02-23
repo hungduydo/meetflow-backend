@@ -35,6 +35,7 @@ export const streamRoute: FastifyPluginAsync = async (fastify) => {
       // Authenticate via Supabase JWT
       const { data: { user }, error: authError } = await supabase.auth.getUser(token);
       if (authError || !user) {
+        fastify.log.warn({ token: token.slice(0, 10) + "...", error: authError?.message }, "WS Authentication failed");
         socket.send(JSON.stringify({ type: "error", message: "Unauthorized" }));
         socket.close(1008, "Unauthorized");
         return;
