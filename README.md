@@ -52,14 +52,34 @@ npm install
 
 # 2. Configure environment
 cp .env.example .env
-# Fill in: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, DEEPGRAM_API_KEY, GEMINI_API_KEY, JWT_SECRET
+```
 
-# 3. Run database migrations
+Edit `.env` and fill in these required values:
+
+| Variable | Where to find it |
+|----------|-----------------|
+| `SUPABASE_URL` | Supabase Dashboard → Settings → API |
+| `SUPABASE_SERVICE_ROLE_KEY` | Supabase Dashboard → Settings → API |
+| `SUPABASE_ANON_KEY` | Supabase Dashboard → Settings → API |
+| `DATABASE_URL` | Supabase Dashboard → Settings → Database → Connection string (URI) |
+| `DEEPGRAM_API_KEY` | console.deepgram.com |
+| `GEMINI_API_KEY` | aistudio.google.com/app/apikey |
+| `JWT_SECRET` | Any random string ≥ 32 chars |
+
+```bash
+# 3. Run database migrations (no Supabase CLI needed — uses pg directly)
 npm run db:migrate
+
+# Rollback all tables if needed
+npm run db:rollback
 
 # 4. Start dev server (hot-reload)
 npm run dev
 ```
+
+> **How migrations work:** `scripts/migrate.ts` connects directly to your Postgres DB
+> via `DATABASE_URL` using the `pg` package. It tracks applied migrations in a
+> `_migrations` table and is fully idempotent — safe to run multiple times.
 
 ## API Endpoints
 

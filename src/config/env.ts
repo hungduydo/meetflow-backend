@@ -1,4 +1,5 @@
 // config/env.ts — B2.5: Central environment validation (Zod)
+import "dotenv/config";
 import { z } from "zod";
 
 const envSchema = z.object({
