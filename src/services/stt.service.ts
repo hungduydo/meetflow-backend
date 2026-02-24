@@ -1,8 +1,6 @@
 // services/stt.service.ts
 // B1.1: WebSocket session management
 // B1.2: Deepgram real-time STT integration (<2s latency target)
-import fs from "fs";
-import path from "path";
 import { createClient, LiveTranscriptionEvents } from "@deepgram/sdk";
 import type { WebSocket } from "@fastify/websocket";
 import { supabase } from "../db/supabase.js";
@@ -11,7 +9,6 @@ import { v4 as uuid } from "uuid";
 
 const deepgram = createClient(env.DEEPGRAM_API_KEY);
 
-const STREAM_URL = 'https://playerservices.streamtheworld.com/api/livestream-redirect/CSPANRADIOAAC.aac';
 export interface TranscriptSegment {
   id: string;
   meetingId: string;
@@ -23,18 +20,34 @@ export interface TranscriptSegment {
   isFinal: boolean;
 }
 
-interface STTSessionState {
-  client: ReturnType<typeof deepgram.listen.live>;
-  chunkBuffer: Buffer[];
-  isOpen: boolean;
+interface SessionEntry {
+  dg: ReturnType<typeof deepgram.listen.live>;
+  ready: boolean;              // true once Deepgram Open event fires
+  queue: Buffer[];             // chunks buffered before ready
+  keepAliveTimer: ReturnType<typeof setInterval>;
 }
 
-// Active sessions: meetingId → STTSessionState
-const sessions = new Map<string, STTSessionState>();
+// Active sessions: meetingId → SessionEntry
+const sessions = new Map<string, SessionEntry>();
 
 /**
  * B1.1: Opens a Deepgram streaming session for a meeting.
- * Forwards final transcripts to the DB and interim ones over the extension WS.
+ *
+ * FIX 1 — Wait for Deepgram's Open event before sending audio.
+ *   The Deepgram SDK opens its own WebSocket internally. Audio sent before
+ *   that socket is OPEN is silently dropped → no transcripts ever arrive.
+ *   Solution: queue chunks until the Open event fires, then flush.
+ *
+ * FIX 2 — Send keepAlive every 8s.
+ *   Deepgram closes idle connections after ~10s of no data. When the user
+ *   pauses speaking the audio stream carries silence, but MediaRecorder may
+ *   produce near-empty chunks that Deepgram's server doesn't count as activity.
+ *   Solution: send Deepgram's keepAlive message on an interval.
+ *
+ * FIX 3 — Correct encoding hint.
+ *   The browser sends audio/webm (Opus). We must tell Deepgram the encoding
+ *   so it can demux the container correctly. Without this it tries to parse
+ *   raw PCM and produces garbage → no transcripts.
  */
 export async function openSTTSession(
   meetingId: string,
@@ -44,63 +57,47 @@ export async function openSTTSession(
     throw new Error(`STT session already active for meeting ${meetingId}`);
   }
 
-  // B1.2: Deepgram live transcription config
-  const client = deepgram.listen.live({
-    model: "nova-2",
+  // FIX 3: Declare encoding=opus and the webm container so Deepgram can
+  // demux the MediaRecorder output correctly.
+  const dgSession = deepgram.listen.live({
     language: env.STT_LANGUAGE,
+    model: "nova-2",
+    encoding: "opus",           // ← matches MediaRecorder "audio/webm;codecs=opus"
+    container: "webm",          // ← tells Deepgram to expect a webm container
+    sample_rate: 16000,
+    channels: 1,
     smart_format: true,
     diarize: true,
     punctuate: true,
     interim_results: true,
     endpointing: 300,
     utterance_end_ms: 1000,
-    encoding: "opus",
-    container: "webm",
-    channels: 1,
-    sample_rate: 16000,
   });
 
-  const sessionState: STTSessionState = {
-    client,
-    chunkBuffer: [],
-    isOpen: false,
+  const entry: SessionEntry = {
+    dg: dgSession,
+    ready: false,
+    queue: [],
+    // FIX 2: keepAlive every 8s to prevent Deepgram's 10s idle timeout
+    keepAliveTimer: setInterval(() => {
+      if (entry.ready) dgSession.keepAlive();
+    }, 8_000),
   };
+  sessions.set(meetingId, entry);
 
-  sessions.set(meetingId, sessionState);
-  // On session open we livesteam a fake meeting for test
-  // client.on(LiveTranscriptionEvents.Open, async () => {
-  //   console.log(`Transcribing ${STREAM_URL}...`);
-
-  //   const response = await fetch(STREAM_URL, { redirect: 'follow' });
-  //   const reader = response?.body?.getReader();
-
-  //   const pump = async () => {
-  //     const { done, value } = await reader!.read();
-  //     if (done) return;
-  //     client.send(value);
-  //     pump();
-  //   };
-  //   pump();
-  // });
-
-  client.on(LiveTranscriptionEvents.Open, () => {
-    console.log(`[STT] Deepgram session opened for meeting ${meetingId}`);
-    sessionState.isOpen = true;
-    while (sessionState.chunkBuffer.length > 0) {
-      const b = sessionState.chunkBuffer.shift();
-      if (b) client.send(b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) as ArrayBuffer);
+  // FIX 1: Buffer chunks until Deepgram's own WS is confirmed open
+  dgSession.on(LiveTranscriptionEvents.Open, () => {
+    entry.ready = true;
+    console.log(`[STT] Deepgram connection open for meeting ${meetingId}. Flushing ${entry.queue.length} queued chunk(s).`);
+    // Flush any chunks that arrived before the connection was ready
+    for (const chunk of entry.queue) {
+      dgSession.send(chunk);
     }
+    entry.queue = [];
   });
 
-  client.on(LiveTranscriptionEvents.Metadata, (metadata) => {
-    console.log(`[STT] Deepgram metadata for meeting ${meetingId}:`, JSON.stringify(metadata));
-  });
-
-  // Forward interim results to extension immediately (< 2s latency)
-  client.on(LiveTranscriptionEvents.Transcript, async (result) => {
-    console.log(`[STT] Transcript event for meeting ${meetingId}:`, JSON.stringify(result));
+  dgSession.on(LiveTranscriptionEvents.Transcript, async (result) => {
     const alt = result.channel?.alternatives?.[0];
-
     if (!alt?.transcript) return;
 
     const segment: TranscriptSegment = {
@@ -114,12 +111,10 @@ export async function openSTTSession(
       isFinal: result.is_final ?? false,
     };
 
-    // Push to extension WS immediately (interim + final)
     if (extensionSocket.readyState === extensionSocket.OPEN) {
       extensionSocket.send(JSON.stringify({ type: "transcript", data: segment }));
     }
 
-    // Persist only final segments to Supabase
     if (segment.isFinal && segment.text.trim()) {
       await supabase.from("transcript_segments").insert({
         id: segment.id,
@@ -134,64 +129,48 @@ export async function openSTTSession(
     }
   });
 
-  client.on(LiveTranscriptionEvents.SpeechStarted, () => {
-    console.log(`[STT] Speech started for meeting ${meetingId}`);
-  });
-
-  client.on(LiveTranscriptionEvents.UtteranceEnd, () => {
-    console.log(`[STT] Utterance end for meeting ${meetingId}`);
-  });
-
-  client.on(LiveTranscriptionEvents.Error, (err) => {
+  dgSession.on(LiveTranscriptionEvents.Error, (err) => {
     console.error(`[STT] Deepgram error for meeting ${meetingId}:`, err);
     if (extensionSocket.readyState === extensionSocket.OPEN) {
       extensionSocket.send(JSON.stringify({ type: "error", message: "STT engine error" }));
     }
   });
 
-  client.on(LiveTranscriptionEvents.Close, () => {
-    console.log(`[STT] Deepgram session closed for meeting ${meetingId}`);
+  dgSession.on(LiveTranscriptionEvents.Close, () => {
+    clearInterval(entry.keepAliveTimer);
     sessions.delete(meetingId);
+    console.log(`[STT] Deepgram session closed for meeting ${meetingId}`);
   });
 }
 
-console.log("[STT-VERSION: 1.0.3] Service initialized");
-
 /**
- * B1.1: Pipe an incoming audio chunk from the extension into the Deepgram session.
+ * B1.1: Pipe an incoming audio chunk into the Deepgram session.
+ * If the session isn't ready yet, queue the chunk (FIX 1).
  */
 export function sendAudioChunk(meetingId: string, chunk: Buffer): void {
-  const sessionState = sessions.get(meetingId);
-  console.log(`[STT-VERSION: 1.0.3] Chunk: ${chunk.length} bytes, Hex: ${chunk.slice(0, 4).toString("hex")}`);
+  const entry = sessions.get(meetingId);
+  if (!entry) throw new Error(`No active STT session for meeting ${meetingId}`);
 
-  // DEBUG: Save incoming audio chunk to file
-  const debugFile = path.join(process.cwd(), `logs/debug-${meetingId}.webm`);
-  if (!fs.existsSync(path.dirname(debugFile))) {
-    fs.mkdirSync(path.dirname(debugFile), { recursive: true });
+  if (!entry.ready) {
+    // FIX 1: Deepgram WS not open yet — buffer the chunk
+    entry.queue.push(chunk);
+    return;
   }
-  fs.appendFileSync(debugFile, chunk);
 
-  if (!sessionState) throw new Error(`No active STT session for meeting ${meetingId}`);
-
-  if (sessionState.isOpen) {
-    console.log(`[STT] SENDING direct to Deepgram (${meetingId})`);
-    sessionState.client.send(chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength) as ArrayBuffer);
-  } else {
-    sessionState.chunkBuffer.push(chunk);
-    console.log(`[STT] BUFFERED chunk ${sessionState.chunkBuffer.length} for meeting ${meetingId}`);
-  }
+  entry.dg.send(chunk);
 }
 
 /**
  * B1.1: Gracefully close and clean up the STT session.
  */
 export async function closeSTTSession(meetingId: string): Promise<void> {
-  const sessionState = sessions.get(meetingId);
-  if (!sessionState) return;
-  sessionState.client.requestClose();
+  const entry = sessions.get(meetingId);
+  if (!entry) return;
+
+  clearInterval(entry.keepAliveTimer);
+  entry.dg.requestClose();
   sessions.delete(meetingId);
 
-  // Mark meeting as completed in DB
   await supabase
     .from("meetings")
     .update({ status: "completed", ended_at: new Date().toISOString() })

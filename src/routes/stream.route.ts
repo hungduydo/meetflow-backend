@@ -35,7 +35,6 @@ export const streamRoute: FastifyPluginAsync = async (fastify) => {
       // Authenticate via Supabase JWT
       const { data: { user }, error: authError } = await supabase.auth.getUser(token);
       if (authError || !user) {
-        fastify.log.warn({ token: token.slice(0, 10) + "...", error: authError?.message }, "WS Authentication failed");
         socket.send(JSON.stringify({ type: "error", message: "Unauthorized" }));
         socket.close(1008, "Unauthorized");
         return;
@@ -65,24 +64,26 @@ export const streamRoute: FastifyPluginAsync = async (fastify) => {
         return;
       }
 
-      // Receive audio chunks from extension — binary frames only
-      socket.on("message", (data: Buffer, isBinary: boolean) => {
-        if (isBinary) {
-          try {
-            sendAudioChunk(meetingId, data);
-          } catch (err) {
-            fastify.log.error(`[WS] Audio chunk error: ${(err as Error).message}`);
+      // FIX 4: @fastify/websocket passes all messages as Buffer regardless of
+      // the isBinary flag. Detect binary vs text by checking if it's valid JSON
+      // instead of trusting isBinary, which is unreliable across ws versions.
+      socket.on("message", (data: Buffer) => {
+        // Try to parse as JSON control message first
+        // Binary audio frames are never valid JSON
+        try {
+          const msg = JSON.parse(data.toString());
+          if (msg.type === "end") {
+            socket.close(1000, "Stream ended");
           }
-        } else {
-          // Handle text control messages (e.g. { type: "end" })
-          try {
-            const msg = JSON.parse(data.toString());
-            if (msg.type === "end") {
-              socket.close(1000, "Stream ended");
-            }
-          } catch {
-            // ignore malformed text frames
-          }
+          return; // was a text/control frame — don't forward to Deepgram
+        } catch {
+          // Not JSON → it's a binary audio chunk, forward to Deepgram
+        }
+
+        try {
+          sendAudioChunk(meetingId, data);
+        } catch (err) {
+          fastify.log.error(`[WS] Audio chunk error: ${(err as Error).message}`);
         }
       });
 
