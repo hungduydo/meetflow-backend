@@ -32,6 +32,47 @@ export const streamRoute: FastifyPluginAsync = async (fastify) => {
 
       const { meetingId, token } = parsed.data;
 
+      // FIX: Register socket handlers FIRST — before any async work — so that
+      // audio chunks arriving while auth/setup is in progress are buffered
+      // rather than silently dropped. Without this, the first 400-700ms of
+      // audio (auth ~100ms + DB ~100ms + Deepgram open ~200ms) is lost and
+      // Deepgram never produces a transcript.
+      const preBuffer: Buffer[] = [];
+      let sessionReady = false;
+
+      socket.on("message", (data: Buffer) => {
+        // Try JSON first — binary audio frames are never valid JSON
+        try {
+          const msg = JSON.parse(data.toString());
+          if (msg.type === "end") {
+            socket.close(1000, "Stream ended");
+          }
+          return; // control frame — don't forward to Deepgram
+        } catch {
+          // Not JSON → binary audio chunk
+        }
+
+        if (sessionReady) {
+          try {
+            sendAudioChunk(meetingId, data);
+          } catch (err) {
+            fastify.log.error(`[WS] Audio chunk error: ${(err as Error).message}`);
+          }
+        } else {
+          // Session not ready yet — buffer the chunk and drain after setup
+          preBuffer.push(data);
+        }
+      });
+
+      socket.on("close", async () => {
+        await closeSTTSession(meetingId);
+        fastify.log.info(`[WS] Session closed: meeting=${meetingId}`);
+      });
+
+      socket.on("error", (err) => {
+        fastify.log.error(`[WS] Socket error: ${err.message}`);
+      });
+
       // Authenticate via Supabase JWT
       const { data: { user }, error: authError } = await supabase.auth.getUser(token);
       if (authError || !user) {
@@ -56,6 +97,12 @@ export const streamRoute: FastifyPluginAsync = async (fastify) => {
 
       try {
         await openSTTSession(meetingId, socket);
+        // Mark ready and drain any chunks that arrived during setup
+        sessionReady = true;
+        for (const chunk of preBuffer) {
+          try { sendAudioChunk(meetingId, chunk); } catch { /* logged above */ }
+        }
+        preBuffer.length = 0;
         socket.send(JSON.stringify({ type: "connected", meetingId }));
         fastify.log.info(`[WS] STT session opened: meeting=${meetingId} user=${user.id}`);
       } catch (err) {
@@ -63,38 +110,6 @@ export const streamRoute: FastifyPluginAsync = async (fastify) => {
         socket.close(1011, "Session error");
         return;
       }
-
-      // FIX 4: @fastify/websocket passes all messages as Buffer regardless of
-      // the isBinary flag. Detect binary vs text by checking if it's valid JSON
-      // instead of trusting isBinary, which is unreliable across ws versions.
-      socket.on("message", (data: Buffer) => {
-        // Try to parse as JSON control message first
-        // Binary audio frames are never valid JSON
-        try {
-          const msg = JSON.parse(data.toString());
-          if (msg.type === "end") {
-            socket.close(1000, "Stream ended");
-          }
-          return; // was a text/control frame — don't forward to Deepgram
-        } catch {
-          // Not JSON → it's a binary audio chunk, forward to Deepgram
-        }
-
-        try {
-          sendAudioChunk(meetingId, data);
-        } catch (err) {
-          fastify.log.error(`[WS] Audio chunk error: ${(err as Error).message}`);
-        }
-      });
-
-      socket.on("close", async () => {
-        await closeSTTSession(meetingId);
-        fastify.log.info(`[WS] Session closed: meeting=${meetingId}`);
-      });
-
-      socket.on("error", (err) => {
-        fastify.log.error(`[WS] Socket error: ${err.message}`);
-      });
     }
   );
 

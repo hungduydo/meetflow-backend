@@ -6,6 +6,7 @@ import type { WebSocket } from "@fastify/websocket";
 import { supabase } from "../db/supabase.js";
 import { env } from "../config/env.js";
 import { v4 as uuid } from "uuid";
+import { log } from "node:console";
 
 const deepgram = createClient(env.DEEPGRAM_API_KEY);
 
@@ -57,13 +58,16 @@ export async function openSTTSession(
     throw new Error(`STT session already active for meeting ${meetingId}`);
   }
 
-  // FIX 3: Declare encoding=opus and the webm container so Deepgram can
-  // demux the MediaRecorder output correctly.
+  // The extension streams raw linear16 PCM (Int16 LE, mono, 16 kHz) captured
+  // via ScriptProcessorNode. This is Deepgram's recommended format for live
+  // streaming — no container overhead, no format ambiguity.
+  // Previous approaches used MediaRecorder → WebM container, which Deepgram's
+  // streaming endpoint cannot parse regardless of the encoding= parameter,
+  // causing it to close the connection immediately with no transcript.
   const dgSession = deepgram.listen.live({
     language: env.STT_LANGUAGE,
     model: "nova-2",
-    encoding: "opus",           // ← matches MediaRecorder "audio/webm;codecs=opus"
-    container: "webm",          // ← tells Deepgram to expect a webm container
+    encoding: "linear16",
     sample_rate: 16000,
     channels: 1,
     smart_format: true,
@@ -99,7 +103,7 @@ export async function openSTTSession(
   dgSession.on(LiveTranscriptionEvents.Transcript, async (result) => {
     const alt = result.channel?.alternatives?.[0];
     if (!alt?.transcript) return;
-
+    console.log(result.channel)
     const segment: TranscriptSegment = {
       id: uuid(),
       meetingId,
@@ -138,8 +142,15 @@ export async function openSTTSession(
 
   dgSession.on(LiveTranscriptionEvents.Close, () => {
     clearInterval(entry.keepAliveTimer);
+    const wasActive = sessions.has(meetingId);
     sessions.delete(meetingId);
     console.log(`[STT] Deepgram session closed for meeting ${meetingId}`);
+    // Notify client if the close was unexpected (i.e. closeSTTSession() was
+    // not the caller — in that case the extension WS is already closed).
+    if (wasActive && extensionSocket.readyState === extensionSocket.OPEN) {
+      console.error(`[STT] Deepgram closed unexpectedly for meeting ${meetingId}`);
+      extensionSocket.send(JSON.stringify({ type: "error", message: "Transcription service closed — please stop and restart recording" }));
+    }
   });
 }
 

@@ -123,3 +123,8 @@ npm run dev
 ```bash
 npm test
 ```
+
+## Get login token for extentions
+```bash
+npx tsx scripts/get-token.ts login duyhung01247@gmail.com Hugo0124@@ 
+```
