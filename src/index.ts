@@ -12,6 +12,7 @@ import { streamRoute } from "./routes/stream.route.js";
 import { meetingsRoute } from "./routes/meetings.route.js";
 import { aiRoute } from "./routes/ai.route.js";
 import { documentsRoute } from "./routes/documents.route.js";
+import { recordingsRoute } from "./routes/recordings.route.js";
 
 async function build() {
   const app = Fastify({
@@ -78,6 +79,7 @@ async function build() {
   await app.register(meetingsRoute, { prefix: "/api/meetings" });
   await app.register(aiRoute, { prefix: "/api/ai" });
   await app.register(documentsRoute, { prefix: "/api/documents" });
+  await app.register(recordingsRoute, { prefix: "/api/recordings" });
 
   // ── Health check ─────────────────────────────────────────────────────────────
   app.get("/health", async () => ({

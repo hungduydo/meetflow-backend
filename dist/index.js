@@ -17,6 +17,7 @@ const stream_route_js_1 = require("./routes/stream.route.js");
 const meetings_route_js_1 = require("./routes/meetings.route.js");
 const ai_route_js_1 = require("./routes/ai.route.js");
 const documents_route_js_1 = require("./routes/documents.route.js");
+const recordings_route_js_1 = require("./routes/recordings.route.js");
 async function build() {
     const app = (0, fastify_1.default)({
         logger: {
@@ -75,6 +76,7 @@ async function build() {
     await app.register(meetings_route_js_1.meetingsRoute, { prefix: "/api/meetings" });
     await app.register(ai_route_js_1.aiRoute, { prefix: "/api/ai" });
     await app.register(documents_route_js_1.documentsRoute, { prefix: "/api/documents" });
+    await app.register(recordings_route_js_1.recordingsRoute, { prefix: "/api/recordings" });
     // ── Health check ─────────────────────────────────────────────────────────────
     app.get("/health", async () => ({
         status: "ok",
